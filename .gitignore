@@ -28,8 +28,24 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+.env/
 env/
 ENV/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Temporary directories
 _temp_local/
@@ -43,5 +59,3 @@ Thumbs.db
 
 # Local satellite debug images
 *.png
-.gitignore_old
-FIRST_COMMIT.txt
