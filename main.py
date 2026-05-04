@@ -38,15 +38,15 @@
 #
 # Autor...........: Guterman / OpenAI
 # Status..........: Em desenvolvimento
-# Versão..........: 0.4.0
+# Versão..........: 0.5.0
 #
 # Histórico
 # ---------
+# 0.5.0 - Atualizado o manual da CLI com os valores reais do novo config,
+#         incluindo o RAM disk padrão de 2048 MB e o comportamento efetivo da
+#         execução sem argumentos.
 # 0.4.0 - Adicionados encerramento controlado via CTRL+C, manual da CLI com
 #         valores reais do config, e resumo final expandido com estatísticas.
-# 0.2.0 - Remoção de --step-minutes da CLI, manutenção de fps como controle
-#         visual da animação, comentários por blocos e tratamento simples de erro.
-# 0.1.0 - Estrutura inicial de CLI com argumentos gerais do pipeline.
 # =============================================================================
 
 from __future__ import annotations
@@ -70,8 +70,6 @@ from pipeline import (
 # =============================================================================
 # [1] CONSOLE GLOBAL DE SAÍDA
 # =============================================================================
-# A console do rich é centralizada neste módulo para manter a saída padronizada
-# e facilitar futura evolução visual da CLI.
 console = Console()
 
 
@@ -88,11 +86,6 @@ def _format_bool_label(value: bool) -> str:
 def _build_cli_manual(defaults: AppConfig) -> str:
     """
     Monta o manual textual da CLI com base nos valores REAIS do config.py.
-
-    Motivo:
-    O usuário pediu explicitamente que a seção de configurações padrão seja
-    coerente com os valores efetivos do arquivo de configuração, e não com os
-    nomes internos das variáveis.
     """
     ramdisk_mode = "monta automaticamente um RAM disk temporário" if (
         defaults.ramdisk.enabled and defaults.ramdisk.create_on_start
@@ -187,7 +180,7 @@ Para alterar qualquer comportamento, utilize os parâmetros da CLI.
 
     Exemplos:
         --fps 1   -> cada frame dura 1 segundo
-        --fps 10  -> animação mais rápida
+        --fps 4   -> animação mais rápida
 
 --gif
     Se presente, gera também um GIF além do MP4.
@@ -216,13 +209,13 @@ Exemplo 1 (básico):
     python main.py --minutes-back 60 --region sudeste_brasil
 
 Exemplo 2 (com controle de velocidade):
-    python main.py --minutes-back 180 --region sudeste_brasil --fps 5
+    python main.py --minutes-back 180 --region sudeste_brasil --fps 4
 
 Exemplo 3 (gerando GIF também):
     python main.py --minutes-back 120 --region sudeste_brasil --gif
 
 Exemplo 4 (com RAM disk temporário):
-    python main.py --minutes-back 240 --region sudeste_brasil --mount-ramdisk --ramdisk-size-mb 512
+    python main.py --minutes-back 240 --region sudeste_brasil --mount-ramdisk --ramdisk-size-mb 2048
 
 ---------------------------------------------------------------------------
 OBSERVAÇÕES IMPORTANTES
@@ -319,10 +312,6 @@ def apply_cli_overrides(args: argparse.Namespace) -> AppConfig:
     """
     Carrega a configuração padrão e aplica sobre ela os overrides recebidos via
     linha de comando.
-
-    Estratégia:
-    - começar da configuração centralizada em config.py
-    - alterar apenas o que o usuário passou explicitamente na CLI
     """
     config = load_config()
 
@@ -371,10 +360,6 @@ def install_ctrl_c_handler(cancel_token: RunCancellationToken) -> Any:
     """
     Instala um handler de CTRL+C que solicita encerramento controlado na primeira
     interrupção e força KeyboardInterrupt na segunda.
-
-    Motivo:
-    Em pipelines com download, encode e RAM disk, o primeiro CTRL+C deve pedir
-    limpeza controlada. O segundo serve como saída forçada caso algo trave.
     """
     previous_handler = signal.getsignal(signal.SIGINT)
     interrupt_count = {"count": 0}
@@ -427,6 +412,14 @@ def print_execution_summary(result: PipelineResult) -> None:
 
     if result.mp4_path:
         console.print(f"[cyan]MP4:[/] {result.mp4_path}")
+        if result.mp4_codec_used:
+            console.print(f"[cyan]Codec MP4:[/] {result.mp4_codec_used}")
+        if result.mp4_engine_label:
+            console.print(f"[cyan]Engine MP4:[/] {result.mp4_engine_label}")
+        if result.mp4_encode_elapsed_s > 0:
+            console.print(f"[cyan]Tempo de encode MP4:[/] {result.mp4_encode_elapsed_s:.2f} s")
+        if result.mp4_output_size_bytes > 0:
+            console.print(f"[cyan]Tamanho do MP4:[/] {_format_megabytes(result.mp4_output_size_bytes)}")
 
     if result.gif_path:
         console.print(f"[cyan]GIF:[/] {result.gif_path}")
@@ -438,62 +431,35 @@ def print_execution_summary(result: PipelineResult) -> None:
 def main() -> int:
     """
     Função principal da aplicação.
-
-    Fluxo:
-    1. constrói o parser
-    2. lê argumentos
-    3. aplica overrides sobre a config padrão
-    4. instala encerramento controlado
-    5. executa o pipeline
-    6. imprime resumo final
-    7. retorna código de status do processo
     """
     cancel_token = RunCancellationToken()
     previous_sigint_handler = None
 
     try:
-        # ---------------------------------------------------------------------
-        # [7.1] LEITURA DA CLI E CONSTRUÇÃO DA CONFIGURAÇÃO EFETIVA
-        # ---------------------------------------------------------------------
         parser = build_parser()
         args = parser.parse_args()
         config = apply_cli_overrides(args)
 
-        # ---------------------------------------------------------------------
-        # [7.2] INSTALAÇÃO DO TRATAMENTO DE CTRL+C
-        # ---------------------------------------------------------------------
         previous_sigint_handler = install_ctrl_c_handler(cancel_token)
 
-        # ---------------------------------------------------------------------
-        # [7.3] DISPARO DO PIPELINE
-        # ---------------------------------------------------------------------
         result = run_pipeline(config, cancel_token=cancel_token)
 
-        # ---------------------------------------------------------------------
-        # [7.4] RESUMO FINAL
-        # ---------------------------------------------------------------------
         print_execution_summary(result)
         return 0
 
     except UserAbortError as exc:
-        # Encerramento controlado solicitado pelo usuário.
         console.print(f"\n[yellow]{exc}[/]")
         return 130
 
     except KeyboardInterrupt:
-        # Interrupção manual forçada pelo usuário.
         console.print("\n[yellow]Execução interrompida pelo usuário.[/]")
         return 130
 
     except Exception as exc:
-        # Tratamento genérico para melhorar visibilidade do erro no terminal.
         console.print(f"\n[bold red]Erro fatal:[/] {exc}")
         return 1
 
     finally:
-        # ---------------------------------------------------------------------
-        # [7.5] RESTAURAÇÃO DO HANDLER DE SINAL ORIGINAL
-        # ---------------------------------------------------------------------
         if previous_sigint_handler is not None:
             signal.signal(signal.SIGINT, previous_sigint_handler)
 

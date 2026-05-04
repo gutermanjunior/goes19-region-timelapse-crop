@@ -5,7 +5,7 @@ Image.MAX_IMAGE_PIXELS = None
 # Image dimensions: 21696x21696 pixels
 # Image center: 10848, 10848
 
-img = Image.open(r"C:\Users\Seu_Usuario\Downloads\20261231850_GOES19-ABI-FD-GEOCOLOR-21696x21696.jpg")
+img = Image.open(r"C:\Users\Guterman Junior\WallpaperGOES\Gemini\timelapse_crop\20261231850_GOES19-ABI-FD-GEOCOLOR-21696x21696.jpg")
 
 
 draw = ImageDraw.Draw(img)

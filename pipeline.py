@@ -34,17 +34,23 @@
 #
 # 6. O pipeline coopera com o encerramento controlado via CTRL+C.
 #
+# 7. A fase de encode MP4 sai do Live do rich e passa a exibir linhas textuais
+#    estilo FFmpeg no terminal, deixando o progresso mais transparente.
+#
 # Autor...........: Guterman / OpenAI
 # Status..........: Em desenvolvimento
-# Versão..........: 0.4.0
+# Versão..........: 0.6.0
 #
 # Histórico
 # ---------
+# 0.6.0 - Alterado o fluxo para encerrar o Live do rich antes do encode e
+#         exibir progresso textual estilo FFmpeg no terminal, seguido pelo
+#         resumo final normal da execução.
+# 0.5.0 - Adicionada telemetria real da fase de encode MP4 com callback do
+#         FFmpeg, retorno expandido do pipeline e exibição explícita de codec e
+#         engine utilizados.
 # 0.4.0 - Adicionados cancelamento cooperativo, telemetria visível de download,
 #         tempos de crop e resumo estatístico da execução.
-# 0.3.0 - Separação explícita entre artefatos efêmeros e persistentes e
-#         limpeza da árvore temporária ao final.
-# 0.2.0 - Implementação funcional do pipeline com manifest JSON e encode final.
 # =============================================================================
 
 from __future__ import annotations
@@ -60,7 +66,6 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import (
     BarColumn,
-    DownloadColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
@@ -72,7 +77,13 @@ from rich.progress import (
 
 from config import AppConfig
 from cropper import crop_image
-from encoder import FFmpegCancelledError, encode_gif, encode_mp4
+from encoder import (
+    FFmpegCancelledError,
+    FFmpegEncodeResult,
+    FFmpegProgress,
+    encode_gif,
+    encode_mp4,
+)
 from goes_client import (
     DownloadCancelledError,
     DownloadProgress,
@@ -104,34 +115,20 @@ class UserAbortError(RuntimeError):
 class RunCancellationToken:
     """
     Token cooperativo de cancelamento da execução.
-
-    Estratégia:
-    - main.py solicita encerramento
-    - pipeline e submódulos consultam o token
-    - se o token estiver acionado, a execução aborta de forma controlada
     """
 
     _event: threading.Event = field(default_factory=threading.Event)
     reason: str = "Execução interrompida pelo usuário."
 
     def request_shutdown(self, reason: str | None = None) -> None:
-        """
-        Solicita o encerramento da execução.
-        """
         if reason:
             self.reason = reason
         self._event.set()
 
     def is_shutdown_requested(self) -> bool:
-        """
-        Informa se já existe pedido de encerramento.
-        """
         return self._event.is_set()
 
     def raise_if_requested(self) -> None:
-        """
-        Lança exceção de encerramento controlado se já houver solicitação.
-        """
         if self.is_shutdown_requested():
             raise UserAbortError(self.reason)
 
@@ -187,18 +184,16 @@ class PipelineResult:
     total_elapsed_s: float
     average_crop_time_s: float
     average_download_speed_mb_s: float
+    mp4_codec_used: str | None = None
+    mp4_engine_label: str | None = None
+    mp4_encode_elapsed_s: float = 0.0
+    mp4_output_size_bytes: int = 0
 
 
 # =============================================================================
 # [4] UTILITÁRIOS INTERNOS
 # =============================================================================
 def _clean_previous_jpgs(directory: Path) -> None:
-    """
-    Remove JPGs antigos de um diretório, se existirem.
-
-    Uso:
-    Esta rotina é defensiva. Evita mistura acidental entre execuções.
-    """
     if not directory.exists():
         return
 
@@ -207,9 +202,6 @@ def _clean_previous_jpgs(directory: Path) -> None:
 
 
 def _write_manifest(path: Path, payload: dict) -> None:
-    """
-    Persiste um manifest JSON da execução.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
@@ -218,17 +210,29 @@ def _write_manifest(path: Path, payload: dict) -> None:
 
 
 def _cleanup_temp_session_root(temp_session_root: Path) -> None:
-    """
-    Remove toda a árvore temporária da execução.
-    """
     shutil.rmtree(temp_session_root, ignore_errors=True)
 
 
 def _format_mb_s(value_in_bytes_per_s: float) -> str:
-    """
-    Converte bytes/s em MB/s para exibição humana.
-    """
     return f"{value_in_bytes_per_s / (1024 * 1024):.2f} MB/s"
+
+
+def _format_mb(value_in_bytes: int) -> str:
+    return f"{value_in_bytes / (1024 * 1024):.1f} MB"
+
+
+def _format_ffmpeg_time(seconds: float) -> str:
+    """
+    Converte segundos em HH:MM:SS.xx para exibição estilo FFmpeg.
+    """
+    if seconds < 0:
+        seconds = 0.0
+
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+
+    return f"{hours:02d}:{minutes:02d}:{secs:05.2f}"
 
 
 def _build_overall_details(
@@ -238,9 +242,6 @@ def _build_overall_details(
     last_crop_s: float | None = None,
     current_frame_label: str = "-",
 ) -> str:
-    """
-    Monta a linha textual de detalhes do progresso geral.
-    """
     parts = [
         f"Esperados {stats.expected_frames}",
         f"Processados {stats.processed_frames}",
@@ -259,11 +260,9 @@ def _build_overall_details(
 
 def _build_progress_layout() -> tuple[Progress, Progress]:
     """
-    Constrói os objetos de progresso visual do rich.
-
-    Estratégia:
-    - uma barra para o avanço geral dos frames
-    - uma barra dedicada ao download do frame atual
+    Constrói dois progress bars:
+    - progresso geral da execução
+    - progresso da fase atual de download
     """
     overall_progress = Progress(
         SpinnerColumn(),
@@ -278,41 +277,63 @@ def _build_progress_layout() -> tuple[Progress, Progress]:
         expand=True,
     )
 
-    download_progress = Progress(
+    phase_progress = Progress(
         TextColumn("[bold yellow]{task.description}"),
         BarColumn(),
-        DownloadColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
         TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[details]}"),
+        TextColumn("• {task.fields[details]}"),
         expand=True,
     )
 
-    return overall_progress, download_progress
+    return overall_progress, phase_progress
 
 
 # =============================================================================
-# [5] NÚCLEO DO PIPELINE
+# [5] CALLBACKS E FORMATADORES DA FASE DE ENCODE
+# =============================================================================
+def _make_ffmpeg_style_printer(total_frames: int):
+    """
+    Retorna um callback que imprime progresso textual estilo FFmpeg.
+
+    Estratégia:
+    - sobrescreve a mesma linha do terminal com carriage return
+    - imprime newline automático ao final do encode
+    """
+    last_printed = {"line": ""}
+
+    def _printer(progress_info: FFmpegProgress) -> None:
+        fps_text = f"{progress_info.fps:.1f}" if progress_info.fps is not None else "N/A"
+        line = (
+            f"frame={progress_info.frame:>5} "
+            f"fps={fps_text:>6} "
+            f"time={_format_ffmpeg_time(progress_info.out_time_seconds)} "
+            f"size={_format_mb(progress_info.total_size_bytes):>8} "
+            f"speed={progress_info.speed:>6} "
+            f"codec={progress_info.codec_used} "
+            f"engine={progress_info.engine_label}"
+        )
+
+        print("\r" + line, end="", flush=True)
+        last_printed["line"] = line
+
+        if progress_info.progress_state == "end":
+            print(flush=True)
+
+    return _printer
+
+
+# =============================================================================
+# [6] NÚCLEO DO PIPELINE
 # =============================================================================
 def _run_inner(
     config: AppConfig,
     ramdisk_root: Path | None,
     cancel_token: RunCancellationToken,
 ) -> PipelineResult:
-    """
-    Executa o pipeline principal.
-
-    Estratégia:
-    - preparar caminhos
-    - gerar specs dos frames
-    - baixar e recortar sequencialmente
-    - persistir manifest
-    - gerar encode final
-    - limpar temporários efêmeros
-    """
-    # -------------------------------------------------------------------------
-    # [5.1] PREPARAÇÃO DOS CAMINHOS
-    # -------------------------------------------------------------------------
     project_paths = build_project_paths(config.root_dir)
     run_id = utc_now().strftime("run_%Y%m%dT%H%M%SZ")
 
@@ -341,9 +362,6 @@ def _run_inner(
 
     _clean_previous_jpgs(run_paths.frames_dir)
 
-    # -------------------------------------------------------------------------
-    # [5.2] RESOLUÇÃO DA REGIÃO E GERAÇÃO DA LISTA DE FRAMES
-    # -------------------------------------------------------------------------
     region = get_region(config.crop.region_name)
 
     frame_specs = build_frame_specs(
@@ -356,9 +374,6 @@ def _run_inner(
 
     stats = RuntimeStats(expected_frames=len(frame_specs))
 
-    # -------------------------------------------------------------------------
-    # [5.3] INICIALIZAÇÃO DA CAMADA DE DOWNLOAD
-    # -------------------------------------------------------------------------
     client = GoesClient(
         timeout_s=config.download.timeout_s,
         max_retries=config.download.max_retries,
@@ -375,9 +390,10 @@ def _run_inner(
 
     mp4_path: Path | None = None
     gif_path: Path | None = None
+    mp4_result: FFmpegEncodeResult | None = None
 
-    overall_progress, download_progress = _build_progress_layout()
-    layout_group = Group(overall_progress, download_progress)
+    overall_progress, phase_progress = _build_progress_layout()
+    layout_group = Group(overall_progress, phase_progress)
 
     try:
         with Live(layout_group, console=console, refresh_per_second=8):
@@ -391,16 +407,16 @@ def _run_inner(
                 ),
             )
 
-            download_task = download_progress.add_task(
-                "Download atual",
+            phase_task = phase_progress.add_task(
+                "Fase atual",
                 total=1,
                 completed=0,
                 visible=False,
-                details="Aguardando próximo frame...",
+                details="Aguardando...",
             )
 
             # -----------------------------------------------------------------
-            # [5.4] LOOP PRINCIPAL: DOWNLOAD + CROP + REGISTRO
+            # [6.1] LOOP PRINCIPAL: DOWNLOAD + CROP + REGISTRO
             # -----------------------------------------------------------------
             for index, frame_spec in enumerate(frame_specs, start=1):
                 cancel_token.raise_if_requested()
@@ -418,9 +434,6 @@ def _run_inner(
                 )
 
                 try:
-                    # ---------------------------------------------------------
-                    # [5.4.1] HEAD opcional para verificar disponibilidade
-                    # ---------------------------------------------------------
                     if (
                         config.download.verify_head_before_get
                         and not client.head_available(frame_spec.url)
@@ -439,25 +452,19 @@ def _run_inner(
                         )
                         continue
 
-                    # ---------------------------------------------------------
-                    # [5.4.2] DOWNLOAD DA IMAGEM-FONTE
-                    # ---------------------------------------------------------
                     source_path = run_paths.downloads_dir / frame_spec.filename
 
                     def _download_callback(progress_info: DownloadProgress) -> None:
-                        """
-                        Atualiza a telemetria do download atual em tempo real.
-                        """
                         details = (
                             f"Frame {current_frame_label} | "
                             f"{frame_timestamp_str} | "
                             f"{_format_mb_s(progress_info.speed_bytes_per_s)}"
                         )
 
-                        download_progress.update(
-                            download_task,
+                        phase_progress.update(
+                            phase_task,
                             description=f"Download: {progress_info.filename}",
-                            total=progress_info.total_bytes if progress_info.total_bytes > 0 else None,
+                            total=progress_info.total_bytes if progress_info.total_bytes > 0 else 1,
                             completed=progress_info.bytes_downloaded,
                             visible=True,
                             details=details,
@@ -473,9 +480,6 @@ def _run_inner(
                     stats.total_downloaded_bytes += download_result.bytes_downloaded
                     stats.total_download_elapsed_s += download_result.elapsed_s
 
-                    # ---------------------------------------------------------
-                    # [5.4.3] GERAÇÃO DO FRAME CROPADO
-                    # ---------------------------------------------------------
                     cancel_token.raise_if_requested()
 
                     crop_started_at = time.perf_counter()
@@ -494,9 +498,6 @@ def _run_inner(
                     stats.successful_frames += 1
                     stats.processed_frames += 1
 
-                    # ---------------------------------------------------------
-                    # [5.4.4] REGISTRO DO FRAME NO MANIFEST
-                    # ---------------------------------------------------------
                     manifest_rows.append(
                         {
                             "frame_index": frame_output_index,
@@ -520,14 +521,11 @@ def _run_inner(
                         }
                     )
 
-                    # ---------------------------------------------------------
-                    # [5.4.5] LIMPEZA OPCIONAL DA IMAGEM-FONTE
-                    # ---------------------------------------------------------
                     if config.pipeline.cleanup_downloaded_sources and source_path.exists():
                         source_path.unlink()
 
-                    download_progress.update(
-                        download_task,
+                    phase_progress.update(
+                        phase_task,
                         visible=False,
                         details="Download concluído.",
                     )
@@ -553,12 +551,11 @@ def _run_inner(
                     stats.failed_frames += 1
                     stats.processed_frames += 1
 
-                    # Limpa fonte parcial, se existir.
                     if 'source_path' in locals() and isinstance(source_path, Path) and source_path.exists():
                         source_path.unlink(missing_ok=True)
 
-                    download_progress.update(
-                        download_task,
+                    phase_progress.update(
+                        phase_task,
                         visible=False,
                         details="Download interrompido/falhou.",
                     )
@@ -579,14 +576,11 @@ def _run_inner(
                         raise
 
             # -----------------------------------------------------------------
-            # [5.5] VALIDAÇÃO PÓS-LOOP
+            # [6.2] VALIDAÇÃO PÓS-LOOP
             # -----------------------------------------------------------------
             if stats.successful_frames == 0:
                 raise RuntimeError("Nenhum frame foi gerado. Verifique download, crop e região.")
 
-            # -----------------------------------------------------------------
-            # [5.6] ESCRITA DO MANIFEST FINAL
-            # -----------------------------------------------------------------
             manifest = {
                 "run_id": run_id,
                 "frames_expected": stats.expected_frames,
@@ -604,88 +598,68 @@ def _run_inner(
                 manifest,
             )
 
-            # -----------------------------------------------------------------
-            # [5.7] ETAPA DE ENCODE FINAL
-            # -----------------------------------------------------------------
-            cancel_token.raise_if_requested()
+        # ---------------------------------------------------------------------
+        # [6.3] A PARTIR DAQUI, O LIVE DO RICH JÁ TERMINOU
+        # ---------------------------------------------------------------------
+        # A decisão aqui é deliberada: durante o encode, trocamos a UI do rich
+        # por linhas textuais estilo FFmpeg no próprio terminal. Isso deixa a
+        # fase final mais transparente e evita a sensação de "congelamento".
+        cancel_token.raise_if_requested()
 
-            if config.encode.enabled:
-                frames_pattern = str(run_paths.frames_dir / "frame_%06d.jpg")
-                base_output_name = f"goes19_{region.name}_{run_id}"
+        if config.encode.enabled:
+            frames_pattern = str(run_paths.frames_dir / "frame_%06d.jpg")
+            base_output_name = f"goes19_{region.name}_{run_id}"
 
-                # -------------------------------------------------------------
-                # [5.7.1] GERAÇÃO DE MP4
-                # -------------------------------------------------------------
-                if config.encode.make_mp4:
-                    overall_progress.update(
-                        overall_task,
-                        description="Gerando MP4 final...",
-                        details=_build_overall_details(
-                            stats,
-                            phase="Encode MP4",
-                            current_frame_label="final",
-                        ),
-                    )
-
-                    mp4_path = run_paths.run_dir / f"{base_output_name}.mp4"
-
-                    codec_used = encode_mp4(
-                        ffmpeg_path=config.encode.ffmpeg_path,
-                        frames_pattern=frames_pattern,
-                        output_path=mp4_path,
-                        fps=config.encode.fps,
-                        prefer_gpu=config.encode.prefer_gpu,
-                        gpu_codec=config.encode.gpu_codec,
-                        gpu_preset=config.encode.gpu_preset,
-                        cpu_codec=config.encode.cpu_codec,
-                        cpu_preset=config.encode.cpu_preset,
-                        crf=config.encode.crf,
-                        cq=config.encode.cq,
-                        cancel_check=cancel_token.is_shutdown_requested,
-                    )
-
-                    console.print(f"[green]MP4 gerado:[/] {mp4_path}")
-                    console.print(f"[green]Codec usado:[/] {codec_used}")
-
-                # -------------------------------------------------------------
-                # [5.7.2] GERAÇÃO OPCIONAL DE GIF
-                # -------------------------------------------------------------
-                if config.encode.make_gif:
-                    overall_progress.update(
-                        overall_task,
-                        description="Gerando GIF final...",
-                        details=_build_overall_details(
-                            stats,
-                            phase="Encode GIF",
-                            current_frame_label="final",
-                        ),
-                    )
-
-                    gif_path = run_paths.run_dir / f"{base_output_name}.gif"
-
-                    encode_gif(
-                        ffmpeg_path=config.encode.ffmpeg_path,
-                        frames_pattern=frames_pattern,
-                        output_path=gif_path,
-                        fps=config.encode.fps,
-                        cancel_check=cancel_token.is_shutdown_requested,
-                    )
-
-                    console.print(f"[green]GIF gerado:[/] {gif_path}")
-
-                overall_progress.update(
-                    overall_task,
-                    description="Baixando e recortando...",
-                    details=_build_overall_details(
-                        stats,
-                        phase="Finalizado",
-                        current_frame_label="fim",
-                    ),
+            if config.encode.make_mp4:
+                console.print("\n[bold cyan]Iniciando encode MP4...[/]")
+                console.print(
+                    f"[cyan]Codec preferencial:[/] {config.encode.gpu_codec} | "
+                    f"[cyan]Preset GPU:[/] {config.encode.gpu_preset} | "
+                    f"[cyan]FPS:[/] {config.encode.fps}"
                 )
 
-        # ---------------------------------------------------------------------
-        # [5.8] RETORNO ESTRUTURADO
-        # ---------------------------------------------------------------------
+                mp4_path = run_paths.run_dir / f"{base_output_name}.mp4"
+                ffmpeg_style_printer = _make_ffmpeg_style_printer(stats.successful_frames)
+
+                mp4_result = encode_mp4(
+                    ffmpeg_path=config.encode.ffmpeg_path,
+                    frames_pattern=frames_pattern,
+                    output_path=mp4_path,
+                    fps=config.encode.fps,
+                    prefer_gpu=config.encode.prefer_gpu,
+                    gpu_codec=config.encode.gpu_codec,
+                    gpu_preset=config.encode.gpu_preset,
+                    gpu_rate_control=config.encode.gpu_rate_control,
+                    gpu_zero_bitrate=config.encode.gpu_zero_bitrate,
+                    cpu_codec=config.encode.cpu_codec,
+                    cpu_preset=config.encode.cpu_preset,
+                    crf=config.encode.crf,
+                    cq=config.encode.cq,
+                    cancel_check=cancel_token.is_shutdown_requested,
+                    progress_callback=ffmpeg_style_printer,
+                )
+
+                console.print(f"[green]MP4 gerado:[/] {mp4_path}")
+                console.print(f"[green]Codec usado:[/] {mp4_result.codec_used}")
+                console.print(f"[green]Engine usada:[/] {mp4_result.engine_label}")
+                console.print(f"[green]Tempo de encode:[/] {mp4_result.elapsed_s:.2f}s")
+                console.print(f"[green]Tamanho final:[/] {_format_mb(mp4_result.output_size_bytes)}")
+
+            if config.encode.make_gif:
+                console.print("\n[bold cyan]Iniciando encode GIF...[/]")
+
+                gif_path = run_paths.run_dir / f"{base_output_name}.gif"
+
+                encode_gif(
+                    ffmpeg_path=config.encode.ffmpeg_path,
+                    frames_pattern=frames_pattern,
+                    output_path=gif_path,
+                    fps=config.encode.fps,
+                    cancel_check=cancel_token.is_shutdown_requested,
+                )
+
+                console.print(f"[green]GIF gerado:[/] {gif_path}")
+
         return PipelineResult(
             run_dir=run_paths.run_dir,
             expected_frames=stats.expected_frames,
@@ -697,25 +671,21 @@ def _run_inner(
             total_elapsed_s=stats.total_elapsed_s,
             average_crop_time_s=stats.average_crop_time_s,
             average_download_speed_mb_s=stats.average_download_speed_mb_s,
+            mp4_codec_used=mp4_result.codec_used if mp4_result else None,
+            mp4_engine_label=mp4_result.engine_label if mp4_result else None,
+            mp4_encode_elapsed_s=mp4_result.elapsed_s if mp4_result else 0.0,
+            mp4_output_size_bytes=mp4_result.output_size_bytes if mp4_result else 0,
         )
 
     except FFmpegCancelledError as exc:
         raise UserAbortError(str(exc)) from exc
 
     finally:
-        # ---------------------------------------------------------------------
-        # [5.9] LIMPEZA DA ÁRVORE TEMPORÁRIA EFÊMERA
-        # ---------------------------------------------------------------------
-        # Esta limpeza remove:
-        # - downloads temporários
-        # - frames temporários, se eles estiverem na área efêmera
-        #
-        # Frames persistentes em output/ não são afetados.
         _cleanup_temp_session_root(run_paths.temp_session_root)
 
 
 # =============================================================================
-# [6] PONTO PÚBLICO DE ENTRADA DO PIPELINE
+# [7] PONTO PÚBLICO DE ENTRADA DO PIPELINE
 # =============================================================================
 def run_pipeline(
     config: AppConfig,
@@ -724,10 +694,6 @@ def run_pipeline(
 ) -> PipelineResult:
     """
     Executa o pipeline com ou sem RAM disk.
-
-    Observação:
-    O mount do ImDisk pode solicitar elevação pontual via UAC, sem que o
-    processo principal inteiro precise rodar como administrador.
     """
     effective_cancel_token = cancel_token or RunCancellationToken()
 

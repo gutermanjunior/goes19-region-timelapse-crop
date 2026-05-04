@@ -22,10 +22,11 @@
 # ------------------------------
 # 1. O passo temporal do GOES neste projeto é tratado como fixo em 10 minutos.
 #
-# 2. O encode preferencial em GPU foi ajustado para HEVC/H.265 com NVENC.
+# 2. O encode preferencial em GPU usa HEVC/H.265 via NVENC, com parâmetros
+#    próximos do comando manual que já se provou rápido no ambiente do usuário.
 #
-# 3. O RAM disk foi configurado para a unidade W:, com 512 MB como padrão
-#    atual de teste.
+# 3. O RAM disk foi configurado para a unidade W:, com 2048 MB como padrão
+#    atual de trabalho, reduzindo o risco de contenção em execuções longas.
 #
 # 4. Quando keep_frames_after_encode = False, o pipeline trata os frames
 #    cropados como artefatos efêmeros. Se houver RAM disk ativo, eles ficam
@@ -36,18 +37,18 @@
 #
 # Autor...........: Guterman / OpenAI
 # Status..........: Em desenvolvimento
-# Versão..........: 0.4.0
+# Versão..........: 0.5.0
 #
 # Histórico
 # ---------
+# 0.5.0 - Ajustados os parâmetros padrão do encode NVENC para se aproximarem do
+#         comando manual validado pelo usuário, ampliado o RAM disk padrão para
+#         2048 MB e adicionados campos explícitos de rate control da GPU.
 # 0.4.0 - Adicionados parâmetros de telemetria visível, manutenção do uso de
 #         UAC sob demanda no ramdisk, e organização para cancelamento
 #         controlado do pipeline.
 # 0.3.0 - Adicionadas opções de elevação pontual do ImDisk, logs do ramdisk e
 #         política de frames efêmeros.
-# 0.2.0 - Reestruturação do cabeçalho, fixação explícita do step em 10 min e
-#         encode preferencial via HEVC NVENC.
-# 0.1.0 - Estrutura inicial com dataclasses básicas de configuração.
 # =============================================================================
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ class DownloadConfig:
     max_retries: int = 2
     chunk_size: int = 1024 * 1024
     verify_head_before_get: bool = False
-    user_agent: str = "Guterman-GOES-Timelapse/0.4"
+    user_agent: str = "Guterman-GOES-Timelapse/0.5"
 
 
 # =============================================================================
@@ -128,7 +129,9 @@ class EncodeConfig:
     # Estratégia de encode preferencial.
     prefer_gpu: bool = True
     gpu_codec: str = "hevc_nvenc"
-    gpu_preset: str = "p5"
+    gpu_preset: str = "p7"
+    gpu_rate_control: str = "vbr"
+    gpu_zero_bitrate: bool = True
 
     # Fallback em CPU, caso NVENC não esteja disponível.
     cpu_codec: str = "libx265"
@@ -138,7 +141,7 @@ class EncodeConfig:
     # - cq para NVENC
     # - crf para encode em CPU
     crf: int = 22
-    cq: int = 25
+    cq: int = 19
 
 
 # =============================================================================
@@ -163,7 +166,7 @@ class RamDiskConfig:
     create_on_start: bool = True
     cli_path: str = "imdisk"
     drive_letter: str = "W:"
-    size_mb: int = 512
+    size_mb: int = 2048
     filesystem: str = "ntfs"
     label: str = "GOESRAM"
     quick_format: bool = True
